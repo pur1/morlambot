@@ -1,4 +1,4 @@
-# Discord Music Bot
+# Morlam Bot
 
 A small, private Discord music bot. Streams audio from YouTube into a voice
 channel using slash commands. State is in-memory — it only runs while your
