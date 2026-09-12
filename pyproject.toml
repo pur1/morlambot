@@ -1,5 +1,5 @@
 [project]
-name = "discord-music-bot"
+name = "morlambot"
 version = "0.1.0"
 description = "A small, private Discord music bot that streams from YouTube."
 requires-python = ">=3.11"

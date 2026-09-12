@@ -15,8 +15,8 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-from player import IDLE_TIMEOUT, GuildPlayer
-from ytdl import ExtractionError, resolve
+from bot.player import IDLE_TIMEOUT, GuildPlayer
+from bot.ytdl import ExtractionError, resolve
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -61,7 +61,14 @@ intents.voice_states = True
 class MusicBot(discord.Client):
     def __init__(self):
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        # Every command needs a guild voice channel, so hide them from DMs
+        # rather than letting them fail there.
+        self.tree = app_commands.CommandTree(
+            self,
+            allowed_contexts=app_commands.AppCommandContext(
+                guild=True, dm_channel=False, private_channel=False
+            ),
+        )
         self.players: dict[int, GuildPlayer] = {}
         # Pending "everyone left" disconnect timers, keyed by guild id.
         self._alone_timers: dict[int, asyncio.Task] = {}
@@ -71,7 +78,8 @@ class MusicBot(discord.Client):
         await self.tree.sync()
 
     async def on_ready(self) -> None:
-        print(f"Logged in as {self.user} ({self.user.id})")
+        if self.user is not None:
+            print(f"Logged in as {self.user} ({self.user.id})")
 
     def get_player(self, guild_id: int) -> GuildPlayer | None:
         return self.players.get(guild_id)
@@ -79,7 +87,7 @@ class MusicBot(discord.Client):
     def drop_player(self, guild_id: int) -> None:
         self.players.pop(guild_id, None)
 
-    async def on_voice_state_update(self, member, before, after) -> None:
+    async def on_voice_state_update(self, member, _before, _after) -> None:
         # Only react to humans moving in/out of the bot's current channel.
         if member.bot:
             return
@@ -121,13 +129,28 @@ bot = MusicBot()
 # -- helpers ----------------------------------------------------------------
 
 
+def _player_for(interaction: discord.Interaction) -> GuildPlayer | None:
+    """The player for this interaction's guild, if any."""
+    if interaction.guild_id is None:
+        return None
+    return bot.get_player(interaction.guild_id)
+
+
 async def _ensure_voice(interaction: discord.Interaction) -> GuildPlayer | None:
     """Return the guild's player, connecting to the user's channel if needed.
 
     Sends an error response and returns None if the user isn't in a voice
     channel, or if the bot is already busy in a different one.
     """
+    guild = interaction.guild
     user = interaction.user
+    # Commands are guild_only, but a DM invocation would hand us a bare User.
+    if guild is None or not isinstance(user, discord.Member):
+        await interaction.response.send_message(
+            "Use this in a server.", ephemeral=True
+        )
+        return None
+
     if not user.voice or not user.voice.channel:
         await interaction.response.send_message(
             "You need to be in a voice channel first.", ephemeral=True
@@ -135,19 +158,24 @@ async def _ensure_voice(interaction: discord.Interaction) -> GuildPlayer | None:
         return None
 
     target = user.voice.channel
-    player = bot.get_player(interaction.guild_id)
+    player = bot.get_player(guild.id)
 
-    if player and player.voice.is_connected():
-        if player.voice.channel.id != target.id:
-            await interaction.response.send_message(
-                "I'm already playing in another voice channel.", ephemeral=True
-            )
-            return None
-        return player
+    if player:
+        if player.voice.is_connected():
+            if player.voice.channel is None or player.voice.channel.id != target.id:
+                await interaction.response.send_message(
+                    "I'm already playing in another voice channel.", ephemeral=True
+                )
+                return None
+            return player
+        # Stale player (kicked or dropped connection): tear it down first so
+        # its playback loop doesn't outlive the reconnect.
+        await player.stop()
+        bot.drop_player(guild.id)
 
     voice = await target.connect()
-    player = GuildPlayer(interaction.guild, voice)
-    bot.players[interaction.guild_id] = player
+    player = GuildPlayer(guild, voice)
+    bot.players[guild.id] = player
     return player
 
 
@@ -179,7 +207,7 @@ async def play(interaction: discord.Interaction, query: str):
 
 @bot.tree.command(description="Skip the current song.")
 async def skip(interaction: discord.Interaction):
-    player = bot.get_player(interaction.guild_id)
+    player = _player_for(interaction)
     if player and player.skip():
         await interaction.response.send_message("⏭️ Skipped.")
     else:
@@ -190,10 +218,10 @@ async def skip(interaction: discord.Interaction):
 
 @bot.tree.command(description="Stop, clear the queue, and disconnect.")
 async def stop(interaction: discord.Interaction):
-    player = bot.get_player(interaction.guild_id)
+    player = _player_for(interaction)
     if player:
         await player.stop()
-        bot.drop_player(interaction.guild_id)
+        bot.drop_player(player.guild.id)
         await interaction.response.send_message("⏹️ Stopped and disconnected.")
     else:
         await interaction.response.send_message(
@@ -203,7 +231,7 @@ async def stop(interaction: discord.Interaction):
 
 @bot.tree.command(description="Pause playback.")
 async def pause(interaction: discord.Interaction):
-    player = bot.get_player(interaction.guild_id)
+    player = _player_for(interaction)
     if player and player.pause():
         await interaction.response.send_message("⏸️ Paused.")
     else:
@@ -214,7 +242,7 @@ async def pause(interaction: discord.Interaction):
 
 @bot.tree.command(description="Resume playback.")
 async def resume(interaction: discord.Interaction):
-    player = bot.get_player(interaction.guild_id)
+    player = _player_for(interaction)
     if player and player.resume():
         await interaction.response.send_message("▶️ Resumed.")
     else:
@@ -225,7 +253,7 @@ async def resume(interaction: discord.Interaction):
 
 @bot.tree.command(description="Show the current queue.")
 async def queue(interaction: discord.Interaction):
-    player = bot.get_player(interaction.guild_id)
+    player = _player_for(interaction)
     if not player or (player.current is None and not player.queue):
         await interaction.response.send_message(
             "The queue is empty.", ephemeral=True
@@ -247,7 +275,7 @@ async def queue(interaction: discord.Interaction):
 
 @bot.tree.command(description="Show the song playing right now.")
 async def nowplaying(interaction: discord.Interaction):
-    player = bot.get_player(interaction.guild_id)
+    player = _player_for(interaction)
     if not player or player.current is None:
         await interaction.response.send_message(
             "Nothing is playing.", ephemeral=True

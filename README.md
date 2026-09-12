@@ -15,18 +15,20 @@ machine is on, and each startup is a fresh listening session.
 | `/queue` | Show what's playing and what's next. |
 | `/nowplaying` | Show the current song. |
 
-The bot auto-disconnects 5 minutes after the queue empties or everyone leaves
-the voice channel.
+Join a voice channel first, then run `/play` — the bot follows you in. It
+auto-disconnects 5 minutes after the queue empties or everyone leaves the
+channel. Commands are server-only; they don't show up in DMs.
 
 ## Setup
 
-### 1. Install FFmpeg
+### 1. Install FFmpeg and Opus
 
-FFmpeg must be on your `PATH`.
+FFmpeg must be on your `PATH`. Opus is what encodes the audio Discord actually
+hears — without it the bot connects but plays silence.
 
 ```bash
-brew install ffmpeg        # macOS
-# sudo apt install ffmpeg  # Debian/Ubuntu/Raspberry Pi OS
+brew install ffmpeg opus                  # macOS
+# sudo apt install ffmpeg libopus0        # Debian/Ubuntu/Raspberry Pi OS
 ```
 
 ### 2. Install Python dependencies
@@ -64,16 +66,33 @@ cp .env.example .env
 ### 5. Run
 
 ```bash
-uv run bot.py
+uv run python -m bot
 ```
 
 Slash commands sync on startup; they may take a minute to appear the first time.
+`Ctrl+C` stops the bot.
+
+## Layout
+
+```
+bot/
+  __main__.py   entry point, client, slash commands
+  player.py     per-guild queue, playback loop, idle/alone timers
+  ytdl.py       yt-dlp extraction -> Track
+```
+
+## Troubleshooting
+
+- **Bot joins but is silent:** Opus didn't load. Startup prints a `WARNING:
+  could not load libopus` line — install it (step 1) and restart.
+- **`/play` suddenly fails on everything:** YouTube likely changed something.
+  Fix: `uv lock --upgrade-package yt-dlp && uv sync`.
+- **Commands don't appear:** re-invite with the `applications.commands` scope,
+  then restart the bot and give Discord a minute.
+- **Bot challenges on a server/VPS:** datacenter IPs sometimes get bot-checked
+  by YouTube. Running on a home machine (as intended here) avoids this.
 
 ## Notes
 
-- **Extraction breaking:** if `/play` suddenly fails on everything, YouTube
-  likely changed something. Fix: `uv lock --upgrade-package yt-dlp && uv sync`.
-- **Bot challenges on a server/VPS:** datacenter IPs sometimes get bot-checked
-  by YouTube. Running on a home machine (as intended here) avoids this.
-- This bot is for private use. Public distribution (75+ servers) is a different
-  project — see the design notes.
+Built for private use. Queue and connection state live in memory only, so a
+restart clears everything.

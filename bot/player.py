@@ -13,7 +13,7 @@ from collections import deque
 
 import discord
 
-from ytdl import FFMPEG_BEFORE_OPTIONS, FFMPEG_OPTIONS, Track
+from bot.ytdl import FFMPEG_BEFORE_OPTIONS, FFMPEG_OPTIONS, Track
 
 IDLE_TIMEOUT = 300  # seconds (5 min) before auto-disconnect when idle/alone
 
@@ -27,6 +27,9 @@ class GuildPlayer:
 
         # Set when a track finishes (or fails) so the loop advances.
         self._track_done = asyncio.Event()
+        # discord.py runs the `after` callback on its audio thread; we need the
+        # loop to hand the signal back safely.
+        self._loop = asyncio.get_running_loop()
         # Pinged whenever a new track is queued, to wake the loop from idle wait.
         self._queued = asyncio.Event()
         self._loop_task = asyncio.create_task(self._run())
@@ -86,12 +89,19 @@ class GuildPlayer:
                 self.current = track
 
                 self._track_done.clear()
-                source = discord.FFmpegPCMAudio(
-                    track.stream_url,
-                    before_options=FFMPEG_BEFORE_OPTIONS,
-                    options=FFMPEG_OPTIONS,
-                )
-                self.voice.play(source, after=self._on_track_end)
+                try:
+                    source = discord.FFmpegPCMAudio(
+                        track.stream_url,
+                        before_options=FFMPEG_BEFORE_OPTIONS,
+                        options=FFMPEG_OPTIONS,
+                    )
+                    self.voice.play(source, after=self._on_track_end)
+                except (discord.ClientException, OSError) as e:
+                    # A bad track (expired URL, ffmpeg missing) must not kill
+                    # the loop — skip it and move to the next one.
+                    print(f"Could not play {track.title}: {e}")
+                    self.current = None
+                    continue
 
                 await self._track_done.wait()
                 self.current = None
@@ -99,8 +109,11 @@ class GuildPlayer:
             pass
 
     def _on_track_end(self, error: Exception | None) -> None:
-        # Runs in discord.py's voice thread; just signal the async loop.
-        self._track_done.set()
+        # Runs on discord.py's audio thread. asyncio.Event is not thread-safe,
+        # so bounce the set() back onto the bot's event loop.
+        if error is not None:
+            print(f"Playback error in {self.guild.name}: {error}")
+        self._loop.call_soon_threadsafe(self._track_done.set)
 
     async def _disconnect_idle(self) -> None:
         self.current = None

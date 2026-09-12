@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any, cast
 
 import yt_dlp
+from yt_dlp.utils import DownloadError
 
 # Suppress yt-dlp's noisy stdout; we surface errors ourselves.
 _YTDL_OPTS = {
@@ -24,12 +26,8 @@ _YTDL_OPTS = {
 }
 
 # FFmpeg reconnect flags keep playback alive if the stream URL stutters.
-FFMPEG_BEFORE_OPTIONS = (
-    "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-)
+FFMPEG_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS = "-vn"
-
-_ytdl = yt_dlp.YoutubeDL(_YTDL_OPTS)
 
 
 class ExtractionError(Exception):
@@ -55,28 +53,56 @@ class Track:
         return f"{m}:{s:02d}"
 
 
-def _extract(query: str) -> dict:
-    """Blocking yt-dlp call. Run via asyncio.to_thread."""
-    info = _ytdl.extract_info(query, download=False)
-    # A search query returns a playlist-shaped dict; take the first entry.
-    if "entries" in info:
-        entries = [e for e in info["entries"] if e]
-        if not entries:
+def _extract(query: str) -> dict[str, Any]:
+    """Blocking yt-dlp call. Run via asyncio.to_thread.
+
+    A fresh YoutubeDL per call: the class is not documented as thread-safe and
+    /play can run concurrently across guilds.
+    """
+    # cast: yt-dlp types its options as a private TypedDict, but a plain dict
+    # is the documented way to pass them.
+    with yt_dlp.YoutubeDL(cast(Any, _YTDL_OPTS)) as ytdl:
+        info = cast("dict[str, Any] | None", ytdl.extract_info(query, download=False))
+        if info is None:
             raise ExtractionError("No results found.")
-        info = entries[0]
-    return info
+        # A search query returns a playlist-shaped dict; take the first entry.
+        if "entries" in info:
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                raise ExtractionError("No results found.")
+            info = entries[0]
+        return cast("dict[str, Any]", ytdl.sanitize_info(cast(Any, info)))
+
+
+def _stream_url(info: dict[str, Any]) -> str | None:
+    """Direct audio URL for the chosen format.
+
+    Usually top-level `url`, but when format selection picks a merged
+    video+audio pair that key is absent and the parts live under
+    `requested_downloads` / `requested_formats`.
+    """
+    url = info.get("url")
+    if url:
+        return url
+    for key in ("requested_downloads", "requested_formats"):
+        for fmt in info.get(key) or []:
+            if fmt.get("acodec", "none") != "none" and fmt.get("url"):
+                return fmt["url"]
+    return None
 
 
 async def resolve(query: str, requested_by: str) -> Track:
     """Resolve a URL or search string to a Track. Raises ExtractionError."""
     try:
         info = await asyncio.to_thread(_extract, query)
-    except yt_dlp.utils.DownloadError as e:
+    except ExtractionError:
+        raise
+    except DownloadError as e:
         raise ExtractionError(_clean_ytdl_error(str(e))) from e
     except Exception as e:  # noqa: BLE001 - yt-dlp raises a wide range
         raise ExtractionError(f"Could not load that track: {e}") from e
 
-    stream_url = info.get("url")
+    stream_url = _stream_url(info)
     if not stream_url:
         raise ExtractionError("That video has no playable audio stream.")
 
